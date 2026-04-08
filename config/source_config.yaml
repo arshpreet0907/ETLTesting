@@ -1,0 +1,13 @@
+# config/source_config.yaml
+# --------------------------
+# Source MySQL database connection details.
+# Used by connections/source_connection.py
+#
+# Fill in your actual values before running the pipeline.
+
+host: localhost          # MySQL server hostname or IP
+port: 3306               # MySQL port
+database: etl_output_mysql      # Source schema / database name
+user: root           # DB username
+password: root  # DB password  ← never commit real passwords to VCS
+fetchsize: 10000         # Rows fetched per JDBC batch (optional; default 10000)

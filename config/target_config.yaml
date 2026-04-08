@@ -1,0 +1,29 @@
+# config/target_config.yaml
+# --------------------------
+# Target database connection details.
+# Used by connections/target_connection.py
+#
+# Set 'type' to either 'mysql' or 'snowflake'.
+# The matching section below will be used.
+
+type: mysql              # mysql | snowflake
+
+# ── MySQL target ──────────────────────────────────────────────────────────────
+# Used when type = mysql
+host: localhost
+port: 3306
+database: target_db
+user: etl_user
+password: your_password
+fetchsize: 10000
+
+# ── Snowflake target ──────────────────────────────────────────────────────────
+# Used when type = snowflake  (or when --target-mode snowflake is passed)
+snowflake:
+  account: your_account        # e.g. xy12345  (without .snowflakecomputing.com)
+  warehouse: COMPUTE_WH
+  database: DW
+  schema: FACT
+  role: ETL_ROLE
+  user: etl_user
+  password: your_password
