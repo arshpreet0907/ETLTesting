@@ -10,6 +10,8 @@ Usage   : from connections.target_connection import get_target_connection
 
 import logging
 
+from typing import Literal
+
 from utils.config_loader import load_config
 
 logger = logging.getLogger(__name__)
@@ -17,7 +19,7 @@ logger = logging.getLogger(__name__)
 _TARGET_CONFIG_PATH = "config/target_config.yaml"
 
 
-def get_target_connection(mode: str = "mysql") -> dict:
+def get_target_connection(mode: Literal['mysql', 'snowflake'] = "mysql") -> dict:
     """
     Read config/target_config.yaml and return a JDBC options dict for the target DB.
 
@@ -101,13 +103,17 @@ def _build_snowflake_opts(cfg: dict) -> dict:
         raise KeyError(f"target_config.yaml [snowflake] missing key(s): {missing}")
 
     account: str = sf["account"]
-    jdbc_url = f"jdbc:snowflake://{account}.snowflakecomputing.com/"
+    database: str = sf["database"]
+    schema: str = sf["schema"]
+    jdbc_url = f"jdbc:snowflake://{account}.snowflakecomputing.com/?db={database}&schema={schema}"
 
     logger.info(
-        "Target Snowflake JDBC URL: %s (user=%s, warehouse=%s)",
+        "Target Snowflake JDBC URL: %s (user=%s, warehouse=%s, db=%s, schema=%s)",
         jdbc_url,
         sf["user"],
         sf["warehouse"],
+        database,
+        schema,
     )
 
     return {
@@ -116,7 +122,7 @@ def _build_snowflake_opts(cfg: dict) -> dict:
         "user": sf["user"],
         "password": sf["password"],
         "sfWarehouse": sf["warehouse"],
-        "sfDatabase": sf["database"],
-        "sfSchema": sf["schema"],
+        "sfDatabase": database,
+        "sfSchema": schema,
         "sfRole": sf["role"],
     }

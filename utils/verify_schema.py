@@ -60,6 +60,69 @@ class SchemaVerificationError(Exception):
 # Public API                                                                   #
 # --------------------------------------------------------------------------- #
 
+def verify_schema_from_ddl(
+    spark: SparkSession,
+    jdbc_opts: dict,
+    ddl_file: str,
+    database: str,
+    table: str,
+    dialect: str = "mysql",
+    schema: str = None,
+) -> bool:
+    """
+    Verify database schema against a DDL file.
+
+    Parameters
+    ----------
+    spark : SparkSession
+    jdbc_opts : dict
+        JDBC connection options
+    ddl_file : str
+        Path to DDL file (CREATE TABLE statement)
+    database : str
+        Database name (for Snowflake) or schema name (for MySQL)
+    table : str
+        Table name
+    dialect : str
+        "mysql" or "snowflake"
+    schema : str, optional
+        Schema name (only for Snowflake, between database and table)
+
+    Returns
+    -------
+    bool
+        True if schema matches, False if mismatches found
+    """
+    logger.info(
+        "Verifying schema for %s.%s against DDL: %s",
+        database, table, ddl_file
+    )
+
+    ddl_columns = _parse_ddl_columns(ddl_file)
+
+    if dialect == "snowflake":
+        # For Snowflake: database is the DB, schema is the schema layer
+        if not schema:
+            schema = jdbc_opts.get("sfSchema", "PUBLIC")
+        live_columns = _fetch_snowflake_schema(spark, jdbc_opts, database, schema, table)
+    else:
+        live_columns = _fetch_mysql_schema(spark, jdbc_opts, database, table)
+
+    mismatches = _compare_columns(ddl_columns, live_columns)
+
+    if mismatches:
+        for m in mismatches:
+            logger.error("[SCHEMA MISMATCH] %s", m)
+        return False
+
+    if dialect == "snowflake":
+        logger.info("Schema verification PASSED for %s.%s.%s", database, schema, table)
+    else:
+        logger.info("Schema verification PASSED for %s.%s", database, table)
+    return True
+
+
+
 def verify_source_schema(
     rulebook: dict,
     spark: SparkSession,
@@ -83,7 +146,7 @@ def verify_source_schema(
     schema_name, tbl = _split_table(full_table)
 
     ddl_path = os.path.join(
-        _PROJECT_ROOT, "generated", table_name, "ddl_source_mysql.sql"
+        _PROJECT_ROOT, "../generated", table_name, "ddl_source_mysql.sql"
     )
 
     logger.info("Verifying source schema for %s (DDL: %s)", full_table, ddl_path)
@@ -129,7 +192,7 @@ def verify_target_schema(
     ddl_file = (
         "ddl_target_mysql.sql" if dialect == "mysql" else "ddl_target_snowflake.sql"
     )
-    ddl_path = os.path.join(_PROJECT_ROOT, "generated", table_name, ddl_file)
+    ddl_path = os.path.join(_PROJECT_ROOT, "../generated", table_name, ddl_file)
 
     logger.info(
         "Verifying target schema for %s (dialect=%s, DDL: %s)",
@@ -139,8 +202,11 @@ def verify_target_schema(
     ddl_columns = _parse_ddl_columns(ddl_path)
 
     if dialect == "snowflake":
+        # For Snowflake, schema_name is actually the database
+        # We need to get the actual schema from jdbc_opts
+        sf_schema = target_jdbc_opts.get("sfSchema", "PUBLIC")
         live_columns = _fetch_snowflake_schema(
-            spark, target_jdbc_opts, schema_name, tbl
+            spark, target_jdbc_opts, schema_name, sf_schema, tbl
         )
     else:
         live_columns = _fetch_mysql_schema(
@@ -241,18 +307,35 @@ def _fetch_mysql_schema(
 def _fetch_snowflake_schema(
     spark: SparkSession,
     jdbc_opts: dict,
+    database_name: str,
     schema_name: str,
     table_name: str,
 ) -> Dict[str, str]:
-    """Query INFORMATION_SCHEMA.COLUMNS on Snowflake via JDBC."""
+    """
+    Query INFORMATION_SCHEMA.COLUMNS on Snowflake via JDBC.
+    
+    Parameters
+    ----------
+    database_name : str
+        Snowflake database name
+    schema_name : str
+        Snowflake schema name (e.g., PUBLIC)
+    table_name : str
+        Table name
+    """
+    # Build fully qualified INFORMATION_SCHEMA reference
+    info_schema = f"{database_name.upper()}.INFORMATION_SCHEMA"
+    
     query = (
         f"SELECT COLUMN_NAME, DATA_TYPE, CHARACTER_MAXIMUM_LENGTH, "
         f"NUMERIC_PRECISION, NUMERIC_SCALE "
-        f"FROM INFORMATION_SCHEMA.COLUMNS "
+        f"FROM {info_schema}.COLUMNS "
         f"WHERE TABLE_SCHEMA = '{schema_name.upper()}' "
         f"AND TABLE_NAME = '{table_name.upper()}' "
         f"ORDER BY ORDINAL_POSITION"
     )
+    
+    logger.info("Snowflake schema query: %s", query)
 
     rows = (
         spark.read.format("jdbc")
@@ -261,6 +344,13 @@ def _fetch_snowflake_schema(
         .load()
         .collect()
     )
+    
+    logger.info("Found %d columns in Snowflake table %s.%s.%s", len(rows), database_name, schema_name, table_name)
+
+    if len(rows) == 0:
+        logger.error("No columns found in Snowflake table %s.%s.%s - table may not exist or connection issue", 
+                     database_name, schema_name, table_name)
+        return {}
 
     result: Dict[str, str] = {}
     for row in rows:
@@ -275,6 +365,9 @@ def _fetch_snowflake_schema(
             else:
                 dtype = f"NUMBER({row['NUMERIC_PRECISION']})"
         result[col] = dtype
+    
+    if result:
+        logger.info("Sample columns from Snowflake: %s", list(result.keys())[:5])
 
     return result
 
@@ -289,7 +382,7 @@ _TYPE_ALIASES: Dict[str, List[str]] = {
     "TINYINT(1)":  ["TINYINT(1)", "BOOLEAN", "BOOL"],
     "SMALLINT":    ["SMALLINT", "SMALLINT(6)"],
     "DATE":        ["DATE"],
-    "DATETIME":    ["DATETIME", "TIMESTAMP"],
+    "DATETIME":    ["DATETIME", "TIMESTAMP", "TIMESTAMP_NTZ", "TIMESTAMP_LTZ", "TIMESTAMP_TZ"],
     "TEXT":        ["TEXT", "LONGTEXT", "MEDIUMTEXT"],
 }
 
@@ -301,6 +394,23 @@ def _types_compatible(ddl_type: str, live_type: str) -> bool:
 
     if ddl_norm == live_norm:
         return True
+
+    # Snowflake NUMBER type compatibility
+    # NUMBER(p,0) is equivalent to NUMBER(p)
+    if ddl_norm.startswith("NUMBER(") and live_norm.startswith("NUMBER("):
+        # Extract precision and scale
+        ddl_match = re.match(r"NUMBER\((\d+)(?:,(\d+))?\)", ddl_norm)
+        live_match = re.match(r"NUMBER\((\d+)(?:,(\d+))?\)", live_norm)
+        
+        if ddl_match and live_match:
+            ddl_precision = ddl_match.group(1)
+            ddl_scale = ddl_match.group(2) or "0"  # Default scale is 0
+            live_precision = live_match.group(1)
+            live_scale = live_match.group(2) or "0"  # Default scale is 0
+            
+            # Compare precision and scale
+            if ddl_precision == live_precision and ddl_scale == live_scale:
+                return True
 
     # Check alias groups
     for canonical, aliases in _TYPE_ALIASES.items():

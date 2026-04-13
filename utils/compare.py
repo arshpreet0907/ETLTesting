@@ -1,41 +1,29 @@
 """
 compare.py
 -----------
-Purpose : Orchestrate the comparison of source_enriched.csv (expected) against
-          target_actual.csv (actual).  This script is intentionally thin:
-          all comparison logic lives in utils/comparator.py and all reporting
-          logic lives in utils/reporter.py.
+Modular comparison module that compares two DataFrames and generates a report.
 
-          This is Stage 6 (final stage) of the ETL validation pipeline.
+Can be used as:
+  1. Standalone script with CLI
+  2. Imported function: compare_and_report()
 
-Inputs  :
-    --source-csv   Path to source_enriched.csv produced by get_source_data.py
-    --target-csv   Path to target_actual.csv produced by get_target_data.py
-    --rulebook     Path to the JSON rulebook (for primary key + column list)
-    --output-dir   Directory where diff_report.csv will be written
-                   (default: output/<table_name>/)
-
-Outputs :
-    output/<table_name>/diff_report.csv
-    Printed summary to stdout
-
-Exit codes:
-    0  — comparison ran; no differences found (PASS)
-    1  — config / argument error
-    3  — comparison ran; differences found (FAIL)
-    99 — unexpected runtime error
-
-Usage   :
-    python compare.py \\
-        --rulebook rulebook/orders_rulebook.json \\
-        --source-csv output/orders/source_enriched.csv \\
-        --target-csv output/orders/target_actual.csv \\
-        --output-dir output/orders
+Usage as module:
+    from compare import compare_and_report
+    
+    exit_code = compare_and_report(
+        spark=spark,
+        source_df=source_df,
+        target_df=target_df,
+        primary_key_cols=["order_id"],
+        compare_cols=["status", "price"],
+        output_path="output/diff_report.csv"
+    )
 """
 
 import argparse
 import os
 import sys
+from pyspark.sql import SparkSession, DataFrame
 
 # ---------------------------------------------------------------------------
 # Bootstrap: make project root importable regardless of working directory
@@ -46,7 +34,7 @@ if _PROJECT_ROOT not in sys.path:
 
 from utils.logger import get_logger
 from utils.rulebook_loader import load_rulebook
-from connections.spark_session import get_spark_session
+from utils.connections.spark_session import get_spark_session
 from utils.comparator import compare_dataframes
 from utils.reporter import generate_report
 
@@ -54,7 +42,64 @@ logger = get_logger(__name__)
 
 
 # --------------------------------------------------------------------------- #
-# Main pipeline function                                                       #
+# Modular function for programmatic use                                       #
+# --------------------------------------------------------------------------- #
+
+def compare_and_report(
+    spark: SparkSession,
+    source_df: DataFrame,
+    target_df: DataFrame,
+    primary_key_cols: list,
+    compare_cols: list,
+    output_path: str,
+) -> int:
+    """
+    Compare two DataFrames and generate a diff report.
+
+    Parameters
+    ----------
+    spark : SparkSession
+        Active Spark session
+    source_df : DataFrame
+        Expected data (transformed source)
+    target_df : DataFrame
+        Actual data (target)
+    primary_key_cols : list of str
+        Primary key column names
+    compare_cols : list of str
+        Non-PK columns to compare
+    output_path : str
+        Path for diff_report.csv
+
+    Returns
+    -------
+    int
+        Exit code: 0 (pass), 3 (differences found)
+    """
+    logger.info("Starting comparison on PK=%s", primary_key_cols)
+
+    diff_df, src_count, tgt_count, matched_count, total_diffs = compare_dataframes(
+        source_df=source_df,
+        target_df=target_df,
+        primary_key_cols=primary_key_cols,
+        compare_cols=compare_cols,
+    )
+
+    exit_code = generate_report(
+        diff_df=diff_df,
+        source_row_count=src_count,
+        target_row_count=tgt_count,
+        matched_row_count=matched_count,
+        total_diff_count=total_diffs,
+        output_path=output_path,
+        exit_on_differences=False,
+    )
+
+    return exit_code
+
+
+# --------------------------------------------------------------------------- #
+# CLI function (backward compatibility)                                        #
 # --------------------------------------------------------------------------- #
 
 def run(
@@ -101,7 +146,7 @@ def run(
     # 3. Resolve output path                                              #
     # ------------------------------------------------------------------ #
     if not output_dir:
-        output_dir = os.path.join(_PROJECT_ROOT, "output", table_name)
+        output_dir = os.path.join(_PROJECT_ROOT, "../output", table_name)
     report_path = os.path.join(output_dir, "diff_report.csv")
 
     # ------------------------------------------------------------------ #
@@ -132,7 +177,7 @@ def run(
     # 6. Delegate comparison                                              #
     # ------------------------------------------------------------------ #
     logger.info("Starting row-by-row comparison...")
-    diff_df, src_count, tgt_count, matched_count = compare_dataframes(
+    diff_df, src_count, tgt_count, matched_count, total_diffs = compare_dataframes(
         source_df=source_df,
         target_df=target_df,
         primary_key_cols=pk_cols,
@@ -147,6 +192,7 @@ def run(
         source_row_count=src_count,
         target_row_count=tgt_count,
         matched_row_count=matched_count,
+        total_diff_count=total_diffs,
         output_path=report_path,
         exit_on_differences=True,  # sys.exit(3) on FAIL, sys.exit(0) on PASS
     )

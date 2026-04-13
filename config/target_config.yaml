@@ -12,18 +12,18 @@ type: mysql              # mysql | snowflake
 # Used when type = mysql
 host: localhost
 port: 3306
-database: target_db
-user: etl_user
-password: your_password
+database: etl_output_mysql_target_joins
+user: root
+password: root
 fetchsize: 10000
 
 # ── Snowflake target ──────────────────────────────────────────────────────────
 # Used when type = snowflake  (or when --target-mode snowflake is passed)
 snowflake:
-  account: your_account        # e.g. xy12345  (without .snowflakecomputing.com)
-  warehouse: COMPUTE_WH
-  database: DW
-  schema: FACT
-  role: ETL_ROLE
-  user: etl_user
-  password: your_password
+  account: RPDEFQT-SJ73076
+  warehouse: ETL_WH
+  database: ETL_OUTPUT_SNOWFLAKE_TARGET_JOINS
+  schema: PUBLIC
+  role: ACCOUNTADMIN
+  user: ARSHPREETSINGH98
+  password: '#Yashkijay@123'

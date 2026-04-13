@@ -58,13 +58,17 @@ def save_dataframe_as_csv(df: DataFrame, file_path: str) -> None:
 
     logger.info("Writing DataFrame to temporary Spark directory: %s", tmp_dir)
 
-    (
-        df.coalesce(1)
-        .write.mode("overwrite")
-        .option("header", "true")
-        .option("nullValue", "")      # write SQL NULLs as empty string in CSV
-        .csv(tmp_dir)
-    )
+    # Cache the DataFrame to avoid recomputation
+    df_cached = df.coalesce(1).cache()
+    
+    # Get count before writing (while cached)
+    row_count = df_cached.count()
+    col_count = len(df_cached.columns)
+
+    df_cached.write.mode("overwrite").option("header", "true").option("nullValue", "").csv(tmp_dir)
+    
+    # Unpersist cache
+    df_cached.unpersist()
 
     # Locate the single part file Spark produced
     part_files = glob.glob(os.path.join(tmp_dir, "part-*.csv"))
@@ -87,14 +91,7 @@ def save_dataframe_as_csv(df: DataFrame, file_path: str) -> None:
 
     # Move the single part file to the desired destination
     shutil.move(part_files[0], file_path)
-    logger.info("CSV saved: %s", file_path)
+    logger.info("CSV saved: %s (%d rows, %d columns)", file_path, row_count, col_count)
 
     # Clean up the temporary Spark directory (_SUCCESS, .crc files, etc.)
     shutil.rmtree(tmp_dir, ignore_errors=True)
-
-    # Log a row-count hint (cheap on a coalesced file)
-    row_count = df.count()          # df is already computed at this point
-    col_count = len(df.columns)
-    logger.info(
-        "Saved %d row(s), %d column(s) → %s", row_count, col_count, file_path
-    )

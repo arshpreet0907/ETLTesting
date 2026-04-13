@@ -20,8 +20,8 @@ from typing import Optional
 
 logger = logging.getLogger(__name__)
 
-# Path to the project root — the directory that contains this file's parent
-_PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+# Path to the project root — go up 3 levels from utils/connections/spark_session.py
+_PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 
 def get_spark_session(app_name: str = "ETLValidator"):
@@ -34,6 +34,7 @@ def get_spark_session(app_name: str = "ETLValidator"):
     2. HADOOP_HOME — set from pipeline_config.yaml if not already in the environment.
        Without this, Spark on Windows raises:
        "Could not locate executable null\\bin\\winutils.exe"
+    3. PYSPARK_PYTHON — set to current Python executable to avoid "Python worker failed" errors.
 
     JAR discovery
     -------------
@@ -52,6 +53,7 @@ def get_spark_session(app_name: str = "ETLValidator"):
         A running local SparkSession.
     """
     _set_env_from_config()
+    _set_python_executable()
     jars_csv = _discover_jars()
 
     from pyspark.sql import SparkSession  # imported here so env vars are set first
@@ -118,6 +120,23 @@ def _set_env_from_config() -> None:
         logger.debug("HADOOP_HOME set from config: %s", hadoop_home)
 
 
+def _set_python_executable() -> None:
+    """
+    Set PYSPARK_PYTHON and PYSPARK_DRIVER_PYTHON to the current Python executable.
+    This prevents "Python worker failed to connect back" errors on Windows.
+    """
+    import sys
+    python_exe = sys.executable
+    
+    if not os.environ.get("PYSPARK_PYTHON"):
+        os.environ["PYSPARK_PYTHON"] = python_exe
+        logger.debug("PYSPARK_PYTHON set to: %s", python_exe)
+    
+    if not os.environ.get("PYSPARK_DRIVER_PYTHON"):
+        os.environ["PYSPARK_DRIVER_PYTHON"] = python_exe
+        logger.debug("PYSPARK_DRIVER_PYTHON set to: %s", python_exe)
+
+
 def _discover_jars() -> str:
     """
     Find all *.jar files in the project's jars/ directory and return them
@@ -129,10 +148,17 @@ def _discover_jars() -> str:
     if not os.path.isdir(jars_dir):
         return ""
 
-    # Use forward slashes for Spark even on Windows
-    jar_paths = [
-        p.replace("\\", "/")
-        for p in glob.glob(os.path.join(jars_dir, "*.jar"))
-    ]
+    jar_paths = []
+    for p in glob.glob(os.path.join(jars_dir, "*.jar")):
+        # Convert to absolute path and then to file:// URI for Windows compatibility
+        abs_path = os.path.abspath(p)
+        # On Windows, convert C:\path to file:///C:/path
+        if os.name == 'nt':
+            # Replace backslashes with forward slashes and add file:/// prefix
+            file_uri = "file:///" + abs_path.replace("\\", "/")
+        else:
+            # On Unix, just add file:// prefix
+            file_uri = "file://" + abs_path
+        jar_paths.append(file_uri)
 
     return ",".join(jar_paths)

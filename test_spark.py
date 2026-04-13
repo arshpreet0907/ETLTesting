@@ -4,16 +4,24 @@ test_spark.py
 Purpose : Quick smoke tests to verify PySpark is working and JDBC connectivity
           is functional before running the full pipeline.
 
-Usage   :
-    python test_spark.py             # runs smoke test only
-    python test_spark.py --mysql     # also tests MySQL JDBC connectivity
-    python test_spark.py --all       # runs all tests
+Usage   : Edit the configuration variables below and run:
+    python test_spark.py
 """
 
-import argparse
 import glob
 import os
 import sys
+
+# ═══════════════════════════════════════════════════════════════════════════
+# CONFIGURATION VARIABLES
+# ═══════════════════════════════════════════════════════════════════════════
+
+# Test options - Set to True to enable specific tests
+TEST_MYSQL = False       # True = test source MySQL connectivity, False = skip
+TEST_TARGET = False      # True = test target DB connectivity, False = skip
+TEST_ALL = True         # True = run all tests, False = run only basic test
+
+# ═══════════════════════════════════════════════════════════════════════════
 
 # ── Set JVM paths from pipeline_config.yaml before importing PySpark ──────────
 _PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
@@ -43,6 +51,14 @@ def get_spark(app_name: str = "SparkTest") -> SparkSession:
         .appName(app_name)
         .config("spark.ui.enabled", "false")
         .config("spark.driver.memory", "1g")
+        .config("spark.driver.host", "localhost")
+        .config("spark.ui.showConsoleProgress", "false")
+        .config("spark.pyspark.python", sys.executable)
+        .config("spark.pyspark.driver.python", sys.executable)
+        # Fix for Snowflake duplicate alias issue
+        .config("spark.sql.autoBroadcastJoinThreshold", "-1")
+        .config("spark.sql.adaptive.enabled", "false")
+        .config("spark.sql.adaptive.coalescePartitions.enabled", "false")
     )
     if jars:
         builder = builder.config("spark.jars", jars)
@@ -58,7 +74,6 @@ def test_spark_basic() -> None:
     data = [("Alice", 30), ("Bob", 25), ("Carol", 35)]
     df = spark.createDataFrame(data, ["name", "age"])
     df.show()
-    spark.stop()
     print("[PASS] PySpark is working correctly.\n")
 
 
@@ -96,14 +111,11 @@ def test_mysql_connectivity() -> None:
         print(f"[FAIL] MySQL connection failed: {exc}\n")
         print(f"       URL: {jdbc_url}")
         print(f"       Check: host/port reachable? credentials correct? JAR in jars/?\n")
-    finally:
-        spark.stop()
-
 
 def test_target_connectivity() -> None:
     """Verify target DB connectivity using target_config.yaml."""
     print("\n[TEST] Target DB connectivity...")
-    from connections.target_connection import get_target_connection
+    from utils.connections.target_connection import get_target_connection
     from utils.config_loader import load_config
 
     cfg = load_config(os.path.join(_PROJECT_ROOT, "config", "target_config.yaml"))
@@ -112,39 +124,38 @@ def test_target_connectivity() -> None:
     print(f"       Target mode: {mode}")
     opts = get_target_connection(mode=mode)
     spark = get_spark("TargetTest")
+    
     try:
-        df = (
-            spark.read.format("jdbc")
-            .options(**opts)
-            .option("query", "SELECT 1 AS ping")
-            .load()
-        )
+        if mode.lower() == "snowflake":
+            # For Snowflake, use dbtable with subquery to avoid duplicate alias issue
+            df = (
+                spark.read.format("jdbc")
+                .options(**opts)
+                .option("dbtable", "(SELECT 1 AS ping) AS test_query")
+                .load()
+            )
+        else:
+            # For MySQL and other databases
+            df = (
+                spark.read.format("jdbc")
+                .options(**opts)
+                .option("query", "SELECT 1 AS ping")
+                .load()
+            )
         df.show()
         print(f"[PASS] Target ({mode}) connection successful.\n")
     except Exception as exc:
         print(f"[FAIL] Target ({mode}) connection failed: {exc}\n")
-    finally:
-        spark.stop()
-
-
-def _parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="PySpark connectivity tests.")
-    parser.add_argument("--mysql", action="store_true",
-                        help="Test source MySQL JDBC connectivity.")
-    parser.add_argument("--target", action="store_true",
-                        help="Test target DB JDBC connectivity.")
-    parser.add_argument("--all", action="store_true",
-                        help="Run all tests.")
-    return parser.parse_args()
 
 
 if __name__ == "__main__":
-    args = _parse_args()
-
+    # Always run basic PySpark test
     test_spark_basic()
 
-    if args.all or args.mysql:
+    # Run MySQL test if enabled
+    if TEST_ALL or TEST_MYSQL:
         test_mysql_connectivity()
 
-    if args.all or args.target:
+    # Run target test if enabled
+    if TEST_ALL or TEST_TARGET:
         test_target_connectivity()

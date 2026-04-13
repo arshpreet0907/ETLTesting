@@ -14,6 +14,16 @@ Output schema
     column_name       : str   — column name that differs
     expected_value    : str   — value from `source_df` (transformed source)
     actual_value      : str   — value from `target_df`
+    diff_type         : str   — MISSING_IN_TARGET | EXTRA_IN_TARGET | VALUE_MISMATCH
+
+Difference types
+----------------
+    MISSING_IN_TARGET — Record exists in source but not in target
+                        (expected_value has data, actual_value is '<MISSING>')
+    EXTRA_IN_TARGET   — Record exists in target but not in source
+                        (expected_value is '<EXTRA>', actual_value has data)
+    VALUE_MISMATCH    — Record exists in both but values differ
+                        (both expected_value and actual_value have data)
 
 Null handling (per spec)
 ------------------------
@@ -60,6 +70,10 @@ def compare_dataframes(
 ) -> Tuple[DataFrame, int, int, int]:
     """
     Compare two DataFrames column-by-column after joining on primary key(s).
+    Handles three scenarios:
+    1. Records in source but NOT in target (missing in target)
+    2. Records in target but NOT in source (extra in target)
+    3. Records in both with value differences
 
     Parameters
     ----------
@@ -78,11 +92,13 @@ def compare_dataframes(
     -------
     diff_df : pyspark.sql.DataFrame
         Exploded diff; schema: primary_key_value, column_name,
-        expected_value, actual_value.
+        expected_value, actual_value, diff_type.
         Empty DataFrame (same schema) when there are no differences.
     source_row_count : int
     target_row_count : int
     matched_row_count : int
+    total_diff_count : int
+        Total number of differences (missing + extra + value mismatches)
     """
     # ------------------------------------------------------------------ #
     # Counts before any transformations                                   #
@@ -95,6 +111,19 @@ def compare_dataframes(
         target_row_count,
         primary_key_cols,
     )
+
+    # ------------------------------------------------------------------ #
+    # Normalize column names to lowercase for case-insensitive comparison #
+    # ------------------------------------------------------------------ #
+    logger.info("Normalizing column names to lowercase")
+    for col in source_df.columns:
+        source_df = source_df.withColumnRenamed(col, col.lower())
+    for col in target_df.columns:
+        target_df = target_df.withColumnRenamed(col, col.lower())
+    
+    # Update column lists to lowercase
+    primary_key_cols = [pk.lower() for pk in primary_key_cols]
+    compare_cols = [col.lower() for col in compare_cols]
 
     # ------------------------------------------------------------------ #
     # Normalise both DataFrames                                           #
@@ -112,53 +141,121 @@ def compare_dataframes(
 
     # ------------------------------------------------------------------ #
     # Join on primary key columns (null-safe, cast to string on both)     #
+    # Cache to avoid recomputation for multiple filters                   #
     # ------------------------------------------------------------------ #
     join_condition = _build_join_condition(primary_key_cols)
-    joined = source_norm.join(target_norm, on=join_condition, how="full")
+    joined = source_norm.join(target_norm, on=join_condition, how="full").cache()
 
     # ------------------------------------------------------------------ #
-    # Add mismatch flag columns for each non-PK column                   #
+    # Identify record presence: source-only, target-only, or both        #
+    # ------------------------------------------------------------------ #
+    # Check if first PK column is null to determine presence
+    first_pk = primary_key_cols[0]
+    src_pk_col = f"{_SRC_PREFIX}{first_pk}"
+    tgt_pk_col = f"{_TGT_PREFIX}{first_pk}"
+    
+    joined = joined.withColumn(
+        "_in_source", F.col(src_pk_col).isNotNull()
+    ).withColumn(
+        "_in_target", F.col(tgt_pk_col).isNotNull()
+    )
+
+    # Separate into three categories
+    missing_in_target = joined.filter(F.col("_in_source") & ~F.col("_in_target"))
+    extra_in_target = joined.filter(~F.col("_in_source") & F.col("_in_target"))
+    in_both = joined.filter(F.col("_in_source") & F.col("_in_target"))
+
+    missing_count = missing_in_target.count()
+    extra_count = extra_in_target.count()
+    in_both_count = in_both.count()
+
+    logger.info(
+        "Records: %d in source only | %d in target only | %d in both",
+        missing_count, extra_count, in_both_count
+    )
+
+    # ------------------------------------------------------------------ #
+    # For records in both: check for value mismatches                    #
     # ------------------------------------------------------------------ #
     mismatch_cols = []
     for col in compare_cols:
         src_col = f"{_SRC_PREFIX}{col}"
         tgt_col = f"{_TGT_PREFIX}{col}"
         flag_col = f"mismatch_{col}"
-        # eqNullSafe returns True when both are null → that is a MATCH
-        # We want True when they are NOT equal (including null vs non-null)
-        joined = joined.withColumn(
+        in_both = in_both.withColumn(
             flag_col,
             ~F.col(src_col).eqNullSafe(F.col(tgt_col)),
         )
         mismatch_cols.append(flag_col)
 
-    # ------------------------------------------------------------------ #
-    # Filter to rows that have at least one mismatch                     #
-    # ------------------------------------------------------------------ #
     any_mismatch = F.lit(False)
     for flag in mismatch_cols:
         any_mismatch = any_mismatch | F.col(flag)
 
-    mismatched_rows = joined.filter(any_mismatch)
+    value_mismatches = in_both.filter(any_mismatch)
+    value_mismatch_count = value_mismatches.count()
+    matched_row_count = in_both_count - value_mismatch_count
 
-    matched_row_count: int = source_row_count - mismatched_rows.count()
     logger.info(
-        "Matched rows: %d | Mismatched rows: %d",
-        matched_row_count,
-        source_row_count - matched_row_count,
+        "Matched rows: %d | Value mismatches: %d",
+        matched_row_count, value_mismatch_count
     )
 
     # ------------------------------------------------------------------ #
-    # Explode to one row per (PK, column_name) difference                #
+    # Short-circuit if no differences found                              #
     # ------------------------------------------------------------------ #
-    diff_df = _explode_differences(
-        mismatched_rows=mismatched_rows,
+    if missing_count == 0 and extra_count == 0 and value_mismatch_count == 0:
+        logger.info("No differences found - skipping diff DataFrame creation")
+        # Unpersist cache before returning
+        joined.unpersist()
+        
+        # Return empty diff DataFrame with correct schema
+        from pyspark.sql import SparkSession
+        from pyspark.sql.types import StructType, StructField, StringType as ST
+        spark = SparkSession.getActiveSession()
+        schema = StructType([
+            StructField("primary_key_value", ST(), True),
+            StructField("column_name", ST(), True),
+            StructField("expected_value", ST(), True),
+            StructField("actual_value", ST(), True),
+            StructField("diff_type", ST(), True),
+        ])
+        empty_diff = spark.createDataFrame([], schema)
+        return empty_diff, source_row_count, target_row_count, matched_row_count, 0
+
+    # ------------------------------------------------------------------ #
+    # Explode all three types of differences                             #
+    # ------------------------------------------------------------------ #
+    logger.info("Creating diff report for %d missing, %d extra, %d value mismatches",
+                missing_count, extra_count, value_mismatch_count)
+    
+    diff_missing = _explode_missing_records(
+        missing_in_target, primary_key_cols, compare_cols, "MISSING_IN_TARGET"
+    )
+    diff_extra = _explode_missing_records(
+        extra_in_target, primary_key_cols, compare_cols, "EXTRA_IN_TARGET"
+    )
+    diff_values = _explode_differences(
+        mismatched_rows=value_mismatches,
         primary_key_cols=primary_key_cols,
         compare_cols=compare_cols,
         mismatch_cols=mismatch_cols,
     )
+    
+    logger.info("Combining all difference types into single report")
 
-    return diff_df, source_row_count, target_row_count, matched_row_count
+    # Combine all differences
+    diff_df = diff_missing.union(diff_extra).union(diff_values)
+    
+    # Calculate total diff count (for missing/extra: 1 per row, for value mismatches: actual count)
+    total_diff_count = missing_count + extra_count + value_mismatch_count
+    
+    logger.info("Total differences to report: %d", total_diff_count)
+    
+    # Unpersist the cached joined DataFrame
+    joined.unpersist()
+
+    return diff_df, source_row_count, target_row_count, matched_row_count, total_diff_count
 
 
 # --------------------------------------------------------------------------- #
@@ -168,26 +265,58 @@ def compare_dataframes(
 def _normalise_df(df: DataFrame, cols: List[str]) -> DataFrame:
     """
     Apply pre-comparison normalisation to selected columns:
-      - Cast to string
-      - Strip surrounding whitespace
-      - Lowercase common boolean literals
+      - Cast to string and trim whitespace
+      - Normalize numeric columns based on schema type (5.2 == 5.20)
+      - Lowercase boolean literals (true/false)
+      
+    Numeric normalization is only applied to columns with numeric schema types
+    (IntegerType, LongType, FloatType, DoubleType, DecimalType) to avoid
+    issues with alphanumeric columns.
     """
+    from pyspark.sql.types import (
+        IntegerType, LongType, FloatType, DoubleType, 
+        DecimalType, ShortType, ByteType
+    )
+    
+    # Identify numeric columns by schema type
+    numeric_types = (IntegerType, LongType, FloatType, DoubleType, 
+                     DecimalType, ShortType, ByteType)
+    numeric_cols = []
+    
+    for field in df.schema.fields:
+        if field.name in cols and isinstance(field.dataType, numeric_types):
+            numeric_cols.append(field.name)
+    
+    logger.info("Detected %d numeric columns for normalization: %s", 
+                len(numeric_cols), numeric_cols[:5] if len(numeric_cols) > 5 else numeric_cols)
+    
+    # Normalize all columns
     for col in cols:
-        df = df.withColumn(
-            col,
-            F.when(
-                F.col(col).isNull(), F.lit(None).cast(StringType())
-            ).otherwise(
-                # Lowercase booleans, then trim whitespace
-                F.trim(
+        if col in numeric_cols:
+            # Numeric column: cast to double for normalization, then to string
+            df = df.withColumn(
+                col,
+                F.when(
+                    F.col(col).isNull(), F.lit(None).cast(StringType())
+                ).otherwise(
+                    F.col(col).cast("double").cast(StringType())
+                ),
+            )
+        else:
+            # Non-numeric column: trim and normalize booleans
+            df = df.withColumn(
+                col,
+                F.when(
+                    F.col(col).isNull(), F.lit(None).cast(StringType())
+                ).otherwise(
                     F.regexp_replace(
-                        F.col(col).cast(StringType()),
+                        F.trim(F.col(col).cast(StringType())),
                         r"(?i)^(true|false)$",
                         F.lower(F.col(col).cast(StringType())),
                     )
-                )
-            ),
-        )
+                ),
+            )
+    
     return df
 
 
@@ -202,6 +331,59 @@ def _build_join_condition(primary_key_cols: List[str]):
     return condition
 
 
+def _explode_missing_records(
+    df: DataFrame,
+    primary_key_cols: List[str],
+    compare_cols: List[str],
+    diff_type: str,
+) -> DataFrame:
+    """
+    Convert missing/extra records into diff format.
+    Creates ONE row per missing/extra record (not one per column).
+    
+    For missing in target: expected_value = '<ALL_COLUMNS>', actual_value = '<MISSING>'
+    For extra in target: expected_value = '<EXTRA>', actual_value = '<ALL_COLUMNS>'
+    """
+    from pyspark.sql import SparkSession
+    from pyspark.sql.types import StructType, StructField, StringType as ST
+
+    spark = SparkSession.getActiveSession()
+    schema = StructType([
+        StructField("primary_key_value", ST(), True),
+        StructField("column_name", ST(), True),
+        StructField("expected_value", ST(), True),
+        StructField("actual_value", ST(), True),
+        StructField("diff_type", ST(), True),
+    ])
+
+    if df.rdd.isEmpty():
+        return spark.createDataFrame([], schema)
+
+    # Determine which prefix to use based on diff_type
+    prefix = _SRC_PREFIX if diff_type == "MISSING_IN_TARGET" else _TGT_PREFIX
+    pk_concat = F.concat_ws("|", *[F.col(f"{prefix}{k}") for k in primary_key_cols])
+
+    # Create single row per missing/extra record instead of one per column
+    if diff_type == "MISSING_IN_TARGET":
+        result = df.select(
+            pk_concat.alias("primary_key_value"),
+            F.lit("<ENTIRE_ROW>").alias("column_name"),
+            F.lit("<PRESENT_IN_SOURCE>").alias("expected_value"),
+            F.lit("<MISSING_IN_TARGET>").alias("actual_value"),
+            F.lit(diff_type).alias("diff_type"),
+        )
+    else:  # EXTRA_IN_TARGET
+        result = df.select(
+            pk_concat.alias("primary_key_value"),
+            F.lit("<ENTIRE_ROW>").alias("column_name"),
+            F.lit("<EXTRA_IN_TARGET>").alias("expected_value"),
+            F.lit("<PRESENT_IN_TARGET>").alias("actual_value"),
+            F.lit(diff_type).alias("diff_type"),
+        )
+
+    return result
+
+
 def _explode_differences(
     mismatched_rows: DataFrame,
     primary_key_cols: List[str],
@@ -212,7 +394,7 @@ def _explode_differences(
     Convert wide-format mismatch rows into one record per differing cell.
 
     Returns a DataFrame with schema:
-        primary_key_value | column_name | expected_value | actual_value
+        primary_key_value | column_name | expected_value | actual_value | diff_type
     """
     from pyspark.sql import SparkSession
     from pyspark.sql.types import StructType, StructField, StringType as ST
@@ -224,6 +406,7 @@ def _explode_differences(
         StructField("column_name", ST(), True),
         StructField("expected_value", ST(), True),
         StructField("actual_value", ST(), True),
+        StructField("diff_type", ST(), True),
     ])
 
     if mismatched_rows.rdd.isEmpty():
@@ -242,6 +425,7 @@ def _explode_differences(
                 F.col(f"{_SRC_PREFIX}{col}").alias("expected_value"),
                 F.col(f"{_TGT_PREFIX}{col}").alias("actual_value"),
                 F.col(flag).alias("is_mismatch"),
+                F.lit("VALUE_MISMATCH").alias("diff_type"),
             )
         )
 
@@ -256,6 +440,7 @@ def _explode_differences(
             F.col("_diff.column_name"),
             F.col("_diff.expected_value"),
             F.col("_diff.actual_value"),
+            F.col("_diff.diff_type"),
         )
     )
 

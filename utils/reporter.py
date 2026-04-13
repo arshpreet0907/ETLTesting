@@ -48,6 +48,7 @@ REQUIRED_DIFF_COLUMNS = {
     "column_name",
     "expected_value",
     "actual_value",
+    "diff_type",
 }
 
 
@@ -56,6 +57,7 @@ def generate_report(
     source_row_count: int,
     target_row_count: int,
     matched_row_count: int,
+    total_diff_count: int,
     output_path: str,
     exit_on_differences: bool = False,
 ) -> int:
@@ -66,7 +68,7 @@ def generate_report(
     ----------
     diff_df : pyspark.sql.DataFrame
         Exploded differences; one row per (primary_key_value, column_name) pair.
-        Must contain columns: primary_key_value, column_name, expected_value, actual_value.
+        Must contain columns: primary_key_value, column_name, expected_value, actual_value, diff_type.
         Pass an *empty* DataFrame (same schema) when there are no differences —
         a "PASS" report will be generated.
     source_row_count : int
@@ -75,6 +77,8 @@ def generate_report(
         Total number of rows read from target_actual.csv.
     matched_row_count : int
         Number of rows that matched exactly (no column-level differences).
+    total_diff_count : int
+        Total number of differences (0 if no differences).
     output_path : str
         Full path for the output diff_report.csv file.
     exit_on_differences : bool
@@ -95,6 +99,31 @@ def generate_report(
     _validate_diff_schema(diff_df)
 
     # ------------------------------------------------------------------ #
+    # Quick check if diff is empty (avoid expensive operations)          #
+    # ------------------------------------------------------------------ #
+    if total_diff_count == 0:
+        logger.info("No differences found - writing empty report")
+        # Write empty CSV quickly
+        os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
+        save_dataframe_as_csv(diff_df, output_path)
+        logger.info("Diff report written to: %s", output_path)
+        
+        # Print summary for PASS case
+        _print_summary(
+            source_row_count=source_row_count,
+            target_row_count=target_row_count,
+            matched_row_count=matched_row_count,
+            mismatched_row_count=0,
+            diff_type_counts={},
+            col_counts={},
+            output_path=output_path,
+        )
+        
+        if exit_on_differences:
+            sys.exit(EXIT_CODE_OK)
+        return EXIT_CODE_OK
+
+    # ------------------------------------------------------------------ #
     # Persist the diff report CSV (even when empty — proves the run ran)  #
     # ------------------------------------------------------------------ #
     os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
@@ -106,6 +135,18 @@ def generate_report(
     # ------------------------------------------------------------------ #
     total_diff_rows: int = diff_df.count()
     mismatched_row_count = source_row_count - matched_row_count
+
+    # Count differences by type
+    diff_type_counts: dict = {}
+    if total_diff_rows > 0:
+        type_count_rows = (
+            diff_df.select("primary_key_value", "diff_type")
+            .distinct()
+            .groupBy("diff_type")
+            .agg(F.count("*").alias("count"))
+            .collect()
+        )
+        diff_type_counts = {row["diff_type"]: row["count"] for row in type_count_rows}
 
     # Count differences per column
     col_counts: dict = {}
@@ -126,6 +167,7 @@ def generate_report(
         target_row_count=target_row_count,
         matched_row_count=matched_row_count,
         mismatched_row_count=mismatched_row_count,
+        diff_type_counts=diff_type_counts,
         col_counts=col_counts,
         output_path=output_path,
     )
@@ -161,6 +203,7 @@ def _print_summary(
     target_row_count: int,
     matched_row_count: int,
     mismatched_row_count: int,
+    diff_type_counts: dict,
     col_counts: dict,
     output_path: str,
 ) -> None:
@@ -174,6 +217,16 @@ def _print_summary(
     print(f"  Total target rows  : {target_row_count:,}")
     print(f"  Matching rows      : {matched_row_count:,}")
     print(f"  Mismatched rows    : {mismatched_row_count:,}")
+
+    if diff_type_counts:
+        print()
+        print("  Difference breakdown:")
+        if "MISSING_IN_TARGET" in diff_type_counts:
+            print(f"    - Missing in target : {diff_type_counts['MISSING_IN_TARGET']:,} records")
+        if "EXTRA_IN_TARGET" in diff_type_counts:
+            print(f"    - Extra in target   : {diff_type_counts['EXTRA_IN_TARGET']:,} records")
+        if "VALUE_MISMATCH" in diff_type_counts:
+            print(f"    - Value mismatches  : {diff_type_counts['VALUE_MISMATCH']:,} records")
 
     if col_counts:
         col_summary = ", ".join(
