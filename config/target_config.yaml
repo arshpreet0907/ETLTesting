@@ -20,10 +20,10 @@ fetchsize: 10000
 # ── Snowflake target ──────────────────────────────────────────────────────────
 # Used when type = snowflake  (or when --target-mode snowflake is passed)
 snowflake:
-  account: RPDEFQT-SJ73076
-  warehouse: ETL_WH
-  database: ETL_OUTPUT_SNOWFLAKE_TARGET_JOINS
-  schema: PUBLIC
-  role: ACCOUNTADMIN
-  user: ARSHPREETSINGH98
-  password: '#Yashkijay@123'
+  account: <account name>
+  warehouse: <ware house>
+  database: <target db>
+  schema: <schema>
+  role: <role>
+  user: <user name>
+  password: <password>
