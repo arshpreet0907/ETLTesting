@@ -29,7 +29,6 @@ Usage
 import logging
 import os
 import sys
-from typing import Optional
 
 from pyspark.sql import DataFrame
 import pyspark.sql.functions as F
@@ -124,40 +123,50 @@ def generate_report(
         return EXIT_CODE_OK
 
     # ------------------------------------------------------------------ #
-    # Persist the diff report CSV (even when empty — proves the run ran)  #
+    # diff_df arrives pre-cached from the comparator — no need to cache   #
+    # or count here.  The comparator materialised diff_df while its join  #
+    # cache was still alive, so all operations below read from that cache  #
+    # without recomputing the join.                                       #
+    # ------------------------------------------------------------------ #
+
+    # ------------------------------------------------------------------ #
+    # Persist the diff report CSV (reads from comparator's cache)         #
     # ------------------------------------------------------------------ #
     os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
     save_dataframe_as_csv(diff_df, output_path)
     logger.info("Diff report written to: %s", output_path)
-
-    # ------------------------------------------------------------------ #
-    # Compute summary statistics from the diff DataFrame                  #
-    # ------------------------------------------------------------------ #
-    total_diff_rows: int = diff_df.count()
     mismatched_row_count = source_row_count - matched_row_count
 
-    # Count differences by type
-    diff_type_counts: dict = {}
-    if total_diff_rows > 0:
-        type_count_rows = (
-            diff_df.select("primary_key_value", "diff_type")
-            .distinct()
-            .groupBy("diff_type")
-            .agg(F.count("*").alias("count"))
-            .collect()
-        )
-        diff_type_counts = {row["diff_type"]: row["count"] for row in type_count_rows}
+    # ------------------------------------------------------------------ #
+    # Single collect for both aggregations — 1 Spark action instead of 2  #
+    # Collects only the 3 lightweight columns needed for summary stats.   #
+    # ------------------------------------------------------------------ #
+    summary_rows = (
+        diff_df.select("primary_key_value", "diff_type", "column_name")
+        .collect()
+    )
 
-    # Count differences per column
-    col_counts: dict = {}
-    if total_diff_rows > 0:
-        col_count_rows = (
-            diff_df.groupBy("column_name")
-            .agg(F.count("*").alias("diff_count"))
-            .orderBy(F.desc("diff_count"))
-            .collect()
-        )
-        col_counts = {row["column_name"]: row["diff_count"] for row in col_count_rows}
+    # Aggregate in Python (trivial for the typically small diff set)
+    from collections import Counter
+
+    # diff_type counts — distinct by (pk, type) to count affected rows
+    seen_pk_types = set()
+    diff_type_counter: dict = Counter()
+    col_counter: dict = Counter()
+
+    for row in summary_rows:
+        pk_type = (row["primary_key_value"], row["diff_type"])
+        if pk_type not in seen_pk_types:
+            seen_pk_types.add(pk_type)
+            diff_type_counter[row["diff_type"]] += 1
+        col_counter[row["column_name"]] += 1
+
+    diff_type_counts = dict(diff_type_counter)
+    # Sort column counts descending (same order as previous Spark orderBy)
+    col_counts = dict(col_counter.most_common())
+
+    # Unpersist diff_df cache — no longer needed after collect
+    diff_df.unpersist()
 
     # ------------------------------------------------------------------ #
     # Print human-readable summary                                        #
@@ -175,7 +184,7 @@ def generate_report(
     # ------------------------------------------------------------------ #
     # Determine exit code                                                 #
     # ------------------------------------------------------------------ #
-    exit_code = EXIT_CODE_OK if total_diff_rows == 0 else EXIT_CODE_DIFFERENCES
+    exit_code = EXIT_CODE_DIFFERENCES
 
     if exit_on_differences:
         sys.exit(exit_code)

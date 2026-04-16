@@ -10,4 +10,4 @@ port: 3306               # MySQL port
 database: etl_output_mysql_xl      # Source schema / database name
 user: root           # DB username
 password: root  # DB password  ← never commit real passwords to VCS
-fetchsize: 10000         # Rows fetched per JDBC batch (optional; default 10000)
+fetchsize: 50000         # Rows fetched per JDBC batch (optional; default 10000)

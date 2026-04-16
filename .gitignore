@@ -8,5 +8,6 @@ excel_files/dummy/etl_output
 excel_files/dummy/vehicle_schemas.json
 docs
 output/*/*.csv
+output/*/*.json
 
 

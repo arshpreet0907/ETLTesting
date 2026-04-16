@@ -14,6 +14,7 @@ Usage   :
 """
 
 import glob
+import json
 import logging
 import os
 import shutil
@@ -30,6 +31,10 @@ def save_dataframe_as_csv(df: DataFrame, file_path: str) -> None:
     The function uses coalesce(1) to produce exactly one Spark part file,
     then renames it to the desired path so callers never have to deal with
     Spark's internal directory structure.
+
+    If the DataFrame is already cached (e.g. from the comparator), the
+    write proceeds directly without creating a second cached copy —
+    avoiding a redundant Spark action.
 
     Parameters
     ----------
@@ -58,17 +63,21 @@ def save_dataframe_as_csv(df: DataFrame, file_path: str) -> None:
 
     logger.info("Writing DataFrame to temporary Spark directory: %s", tmp_dir)
 
-    # Cache the DataFrame to avoid recomputation
-    df_cached = df.coalesce(1).cache()
-    
-    # Get count before writing (while cached)
-    row_count = df_cached.count()
-    col_count = len(df_cached.columns)
+    col_count = len(df.columns)
+    row_count = 0
 
-    df_cached.write.mode("overwrite").option("header", "true").option("nullValue", "").csv(tmp_dir)
-    
-    # Unpersist cache
-    df_cached.unpersist()
+    # Check if already cached — if so, write directly without a second cache
+    is_cached = df.is_cached
+    if is_cached:
+        # DF is already cached upstream — write straight through
+        df.coalesce(1).write.mode("overwrite").option("header", "true").option("nullValue", "").csv(tmp_dir)
+    else:
+        # Not cached — cache the coalesced DF so the count and write share
+        # a single materialisation
+        df_cached = df.coalesce(1).cache()
+        row_count = df_cached.count()
+        df_cached.write.mode("overwrite").option("header", "true").option("nullValue", "").csv(tmp_dir)
+        df_cached.unpersist()
 
     # Locate the single part file Spark produced
     part_files = glob.glob(os.path.join(tmp_dir, "part-*.csv"))
@@ -91,7 +100,24 @@ def save_dataframe_as_csv(df: DataFrame, file_path: str) -> None:
 
     # Move the single part file to the desired destination
     shutil.move(part_files[0], file_path)
+
+    # For pre-cached DFs, derive row count from the written file (header line excluded)
+    if is_cached:
+        # Count lines in the written CSV minus header — avoids a Spark action
+        with open(file_path, "r", encoding="utf-8") as f:
+            row_count = sum(1 for _ in f) - 1  # subtract header
+            row_count = max(row_count, 0)
+
     logger.info("CSV saved: %s (%d rows, %d columns)", file_path, row_count, col_count)
+
+    # Save DataFrame schema alongside CSV for type-safe reloading.
+    # When CSVs are later loaded via load_csvs(), this JSON file is used
+    # to apply the original schema so numeric/date types are preserved
+    # and the comparator's normalisation works correctly.
+    schema_path = os.path.splitext(file_path)[0] + ".schema.json"
+    with open(schema_path, "w", encoding="utf-8") as sf:
+        sf.write(json.dumps(json.loads(df.schema.json()), indent=2))
+    logger.info("Schema saved: %s", schema_path)
 
     # Clean up the temporary Spark directory (_SUCCESS, .crc files, etc.)
     shutil.rmtree(tmp_dir, ignore_errors=True)

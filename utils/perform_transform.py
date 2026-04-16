@@ -85,8 +85,7 @@ def perform_transform(
         raise
 
     logger.info(
-        "Transformation complete: %d rows, %d columns: %s",
-        df_transformed.count(),
+        "Transformation complete: %d columns: %s",
         len(df_transformed.columns),
         df_transformed.columns
     )

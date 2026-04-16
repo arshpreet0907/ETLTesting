@@ -62,6 +62,9 @@ _SNOWFLAKE_MAP = {
     "int":     "NUMBER(10,0)",
     "datetime":"TIMESTAMP_NTZ",
     "datetime2":"TIMESTAMP_NTZ",
+    "timestamp":"TIMESTAMP_NTZ",
+    "timestamp_ntz":"TIMESTAMP_NTZ",
+    "timestampntz":"TIMESTAMP_NTZ",
 }
 
 _POSTGRES_MAP = {
@@ -114,6 +117,7 @@ def _normalise_dtype(raw: str, dialect: str) -> str:
         d = re.sub(r'\bINT\b(?!\()', 'NUMBER(10,0)', d, flags=re.IGNORECASE)
         d = re.sub(r'\bDECIMAL\b', 'NUMBER', d, flags=re.IGNORECASE)
         d = re.sub(r'\bDATETIME\b', 'TIMESTAMP_NTZ', d, flags=re.IGNORECASE)
+        d = re.sub(r'\bTIMESTAMP\b(?!_NTZ)', 'TIMESTAMP_NTZ', d, flags=re.IGNORECASE)
         d = re.sub(r'\bVARCHAR\b(?!\()', 'VARCHAR(256)', d, flags=re.IGNORECASE)
         return d
 
@@ -280,8 +284,9 @@ def build_extract_sql(spec: dict) -> str:
             aliased = f"{jd['join_alias']}_{col}"
             select_parts.append(f"    {jd['join_alias']}.{col} AS {aliased}")
 
-    order_cols = [f"{ap}{p}" for p in pks] if pks else []
-    order_clause = f"\nORDER BY {', '.join(order_cols)}" if order_cols else ""
+    # removing order by in extract ORDER BY omitted — Spark join handles ordering internally.
+    # order_cols = [f"{ap}{p}" for p in pks] if pks else []
+    # order_clause = f"\nORDER BY {', '.join(order_cols)}" if order_cols else ""
 
     from_line = f"FROM {tname}{(' ' + ma) if ma else ''}"
     join_lines = []
@@ -362,7 +367,9 @@ def build_extract_sql(spec: dict) -> str:
     comment_lines += ["--"] + where_placeholder_lines
 
     sql_parts = [from_line] + join_lines
-    full_sql = "\n".join(sql_parts) + order_clause + ";"
+    # ORDER BY omitted — Spark join handles ordering internally.
+    # full_sql = "\n".join(sql_parts) + order_clause + ";"
+    full_sql = "\n".join(sql_parts) + ";"
 
     return "\n".join(comment_lines) + "\n\nSELECT\n" + ",\n".join(select_parts) + "\n" + full_sql
 
@@ -516,6 +523,28 @@ def _spark_expr(rule: str, src: str) -> str:
     r = rule.strip()
     first = r.split("\n")[0].strip()
 
+    # ── Python ternary with `is None` / `is not None`:
+    # e.g. "0 if defect_type_cd is None else 1"
+    # e.g. "1 if defect_type_cd is not None else 0"
+    m_none = re.match(
+        r'^(.+?)\s+if\s+(\w+)\s+is\s+(not\s+)?None\s+else\s+(.+)$',
+        first, re.I,
+    )
+    if m_none:
+        true_val  = m_none.group(1).strip()
+        col_name  = m_none.group(2).strip()
+        is_not    = bool(m_none.group(3))
+        false_val = m_none.group(4).strip()
+        if col_name == "val":
+            col_name = src
+        col_expr  = f"F.col('{col_name}')"
+        true_lit  = _lit_or_col(true_val,  src)
+        false_lit = _lit_or_col(false_val, src)
+        if is_not:
+            return f"F.when({col_expr}.isNotNull(), {true_lit}).otherwise({false_lit})"
+        else:
+            return f"F.when({col_expr}.isNull(), {true_lit}).otherwise({false_lit})"
+
     # ── Python ternary:  <true_val> if <col/val> == <cmp_val> else <false_val>
     # Handles both  "1 if val == 'Y' else 0"  and  "1 if status == 'Y' else 0"
     m = re.match(
@@ -625,6 +654,10 @@ def _spark_expr(rule: str, src: str) -> str:
         .replace("ifnull(", "coalesce(")
     )
     safe = re.sub(r'\bIF\s*\(', 'CASE WHEN ', safe, flags=re.IGNORECASE)
+    # In Spark SQL, + is numeric-only; || is string concatenation.
+    # Detect MySQL/Python-style string concat (col + ' ' + col) and convert + to ||.
+    if "'" in safe and '+' in safe:
+        safe = safe.replace(' + ', ' || ')
     return f'F.expr("{safe}"){sfx}'
 
 
@@ -644,6 +677,11 @@ def _const_spark(rule: str) -> str:
         return "F.lit(None).cast(IntegerType())  # identity — DB assigns"
     if up in ("NULL", "NONE"):
         return "F.lit(None)"
+    if up == "SYS_BATCH_ID":
+        # SYS_BATCH_ID is an ETL engine system variable injected at load time.
+        # It does not exist as a source column, so use a placeholder literal.
+        # batch_id should be added to EXCLUDE_COLS so it is not compared.
+        return 'F.lit("ETL_VALIDATION")  # placeholder — real batch ID set by ETL engine'
     if r.startswith("'") and r.endswith("'"):
         return f'F.lit("{r[1:-1]}")'
     try:
@@ -750,7 +788,6 @@ def build_transform_py(spec: dict, sheet_name: str, dialect: str = "mysql") -> s
     a("        raise ValueError(f\"dialect must be 'mysql' or 'snowflake', got {dialect!r}\")")
     a('    logger.info("=" * 70)')
     a(f"    logger.info('START TRANSFORM | {src_tname} -> {tgt_tname} | dialect=%s', dialect)")
-    a("    logger.info('  Input  rows : %d', df.count())")
     a("    logger.info('  Input  cols : %s', df.columns)")
     a("")
 
@@ -762,6 +799,9 @@ def build_transform_py(spec: dict, sheet_name: str, dialect: str = "mysql") -> s
         for fc in jd.get("fetch_columns", []):
             aliased = f"{jd['join_alias']}_{fc}"
             join_alias_map[f"{jd['join_alias']}.{fc}".lower()] = aliased
+
+    # Collect non-nullable column names for batched null check after all transforms
+    _nn_cols_gen: list[str] = []
 
     for m in mappings:
         tt   = m["transform_type"]
@@ -808,12 +848,7 @@ def build_transform_py(spec: dict, sheet_name: str, dialect: str = "mysql") -> s
 
         # Null handling
         if not nh or nh == "error":
-            safe_tgt = tgt.replace("'", "\\'")
-            var_nc = f"_nc_{tgt}"
-            a(f"    {var_nc} = df.filter(F.col('{safe_tgt}').isNull()).count()")
-            a(f"    if {var_nc} > 0:")
-            a(f"        logger.error(\"  NULL in non-nullable '{safe_tgt}': %d rows\", {var_nc})")
-            a(f"        raise ValueError(f\"NULL in non-nullable '{safe_tgt}': {{{var_nc}}} rows\")")
+            _nn_cols_gen.append(tgt)
         elif nh == "fill_zero":
             a(f"    df = df.fillna({{'{tgt}': 0}})")
         elif nh == "fill_empty":
@@ -831,6 +866,27 @@ def build_transform_py(spec: dict, sheet_name: str, dialect: str = "mysql") -> s
     a(f"        logger.warning('  Missing target cols: %s', _miss)")
     a(f"    df = df.select(*_pres)")
 
+    # ── Batched null validation (single Spark action) ─────────────────────
+    if _nn_cols_gen:
+        a("")
+        a("    # ── Batch null validation (single Spark action) ──────────────────")
+        a(f"    _nn_cols = {_nn_cols_gen!r}")
+        a("    _null_exprs = [F.count(F.when(F.col(c).isNull(), 1)).alias(f'_null_{c}') for c in _nn_cols]")
+        a("    _null_exprs.append(F.count('*').alias('_total_rows'))")
+        a("    _null_result = df.select(*_null_exprs).first()")
+        a("    _null_violations = {c: _null_result[f'_null_{c}'] for c in _nn_cols if _null_result[f'_null_{c}'] > 0}")
+        a("    if _null_violations:")
+        a("        for _col, _cnt in _null_violations.items():")
+        a("            logger.error(\"  NULL in non-nullable '%s': %d rows\", _col, _cnt)")
+        a("        raise ValueError(f'NULL values in non-nullable columns: {_null_violations}')")
+        a("    logger.info('  Null check passed for %d non-nullable columns', len(_nn_cols))")
+        a("    logger.info('  Output rows : %d', _null_result['_total_rows'])")
+    else:
+        # No non-nullable columns — still need row count
+        a("")
+        a("    _row_count = df.count()")
+        a("    logger.info('  Output rows : %d', _row_count)")
+
     # ── Dialect coercion block (Snowflake only) ──────────────────────────
     coerce_lines = _build_dialect_coercion_block(tgt_col_types)
     if coerce_lines:
@@ -841,7 +897,6 @@ def build_transform_py(spec: dict, sheet_name: str, dialect: str = "mysql") -> s
         for cl in coerce_lines:
             a(f"    {cl}")
 
-    a(f"    logger.info('  Output rows : %d', df.count())")
     a(f"    logger.info('  Output cols : %s', df.columns)")
     a(f"    logger.info('END TRANSFORM | dialect=%s', dialect)")
     a(f"    logger.info('=' * 70)")
@@ -1178,7 +1233,8 @@ def build_extract_target(spec: dict, dialect: str) -> str:
     col_names_lower = [c["name"].lower() for c in spec["target_schema"]["columns"]]
     pks    = spec["target_schema"]["primary_keys"]
     col_l  = ",\n".join(f"    {c}" for c in cols)
-    order  = f"\nORDER BY {', '.join(pks)}" if pks else ""
+    # ORDER BY omitted — Spark join handles ordering internally.
+    # order  = f"\nORDER BY {', '.join(pks)}" if pks else ""
     dlbl   = DIALECT_NOTES[dialect]
 
     _has_created = "created_at" in col_names_lower
@@ -1227,7 +1283,8 @@ def build_extract_target(spec: dict, dialect: str) -> str:
         f"",
         f"SELECT",
         col_l,
-        f"FROM {tname}{order};",
+        # f"FROM {tname}{order};", #ORDER BY omitted — Spark join handles ordering internally.
+        f"FROM {tname};",
     ]
     return "\n".join(lines)
 

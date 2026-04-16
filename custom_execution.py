@@ -35,16 +35,22 @@ from datetime import timedelta
 from typing import Literal, Optional, Set
 
 from utils.connections.spark_session import get_spark_session
-from utils.get_data import get_data
-from utils.perform_transform import perform_transform
-from utils.compare import compare_and_report
-from utils.verify_schema import verify_schema_from_ddl
-from utils.connections.source_connection import get_source_connection
-from utils.connections.target_connection import get_target_connection
+from utils.auto_config import get_table_config, list_available_tables
 from utils.logger import get_logger
-from utils.csv_writer import save_dataframe_as_csv
-from utils.auto_config import get_table_config, list_available_tables, build_filter_for_query
-from utils.query_filter import build_where_clause, apply_filter_to_sql, get_columns_from_ddl
+from utils.custom_execution_utils import (
+    step_0_verify_source_schema,
+    step_1_extract_source,
+    step_2_transform,
+    step_3_save_source_csv,
+    step_3_5_verify_target_schema,
+    step_4_extract_target,
+    step_4_1_save_target_csv,
+    step_5_compare,
+    load_csvs,
+    load_source_csv,
+    load_target_csv,
+    build_load_filters,
+)
 
 logger = get_logger(__name__)
 
@@ -58,7 +64,7 @@ logger = get_logger(__name__)
 # │ Just set the table name — query files, transform, PKs auto-detected.   │
 # └─────────────────────────────────────────────────────────────────────────┘
 
-TABLE_NAME = "cost_ledger"      # Set to None to use manual configuration below.
+TABLE_NAME = "employee_master"  # Set to None to use manual configuration below.
                                 # Available: cost_ledger, employee_master,
                                 # engine_assembly_log, logistics_shipments,
                                 # paint_shop_log, parts_inventory,
@@ -66,9 +72,30 @@ TABLE_NAME = "cost_ledger"      # Set to None to use manual configuration below.
                                 # sales_orders, supplier_master,
                                 # vehicle_master, warranty_claims
 
-TARGET_MODE: Literal["mysql", "snowflake"] = "snowflake"
+TARGET_MODE: Literal["mysql", "snowflake"] = "mysql"
 
 VERIFY_SCHEMA = True            # Set True to verify source & target schemas before run.
+
+# ┌─────────────────────────────────────────────────────────────────────────┐
+# │ CSV RE-USE MODE                                                         │
+# │ Set True to skip steps 0–3 (source extract + transform + CSV write)     │
+# │ and load the previously saved transformed CSV instead.                  │
+# │ The schema is restored from the .schema.json file saved alongside the   │
+# │ CSV, so numeric/date types are preserved for accurate comparison.       │
+# │ Pipeline continues from step 3.5 (target schema check) onward.         │
+# └─────────────────────────────────────────────────────────────────────────┘
+USE_SAVED_SOURCE_CSV: bool = False
+
+# ┌─────────────────────────────────────────────────────────────────────────┐
+# │ TARGET CSV RE-USE MODE                                                  │
+# │ Set True to also skip steps 3.5–4 (target schema check + extraction)    │
+# │ and load the previously saved target CSV instead.                       │
+# │ Requires step 4.1 (save target CSV) to have been run at least once.     │
+# │ When both USE_SAVED_SOURCE_CSV and USE_SAVED_TARGET_CSV are True,       │
+# │ the pipeline skips all extraction and goes directly to step 5 (compare).│
+# └─────────────────────────────────────────────────────────────────────────┘
+USE_SAVED_TARGET_CSV: bool = False
+
 COMPARE_COLS  = None            # None = auto-detect all non-PK columns.
                                 # Or specify: ["col1", "col2"]
 
@@ -137,7 +164,7 @@ PK_SET: Set = {110010001,110010002,110010003,110010004,110010005,110010006,11001
 #   - Set DATE_TO   = None to skip the upper bound.
 #   - An error is raised if the column name is not found in the table DDL.
 
-DATE_WATERMARK_MODE: Literal["full", "range"] = "range"
+DATE_WATERMARK_MODE: Literal["full", "range"] = "full"
 
 # Lower date bound: WHERE DATE_FROM_COL >= DATE_FROM
 DATE_FROM:     Optional[str] = "2020-06-10 04:52:53"            # e.g. "2024-01-01" or "2024-01-01 00:00:00"
@@ -148,6 +175,32 @@ DATE_TO:       Optional[str] = "2024-09-07 16:26:19"            # e.g. "2024-06-
 DATE_TO_COL:   Optional[str] = "created_at"   # Column to apply the upper bound on.
                                                # Can be the same as DATE_FROM_COL.
 # Pk and Date modes work in AND mode
+
+# ============================================================================
+# SECTION 4 — JDBC PARTITIONING (MySQL only)
+# ============================================================================
+#
+# Parallelises JDBC reads by splitting the query into N partitions,
+# each fetched by a separate JDBC connection in parallel.
+#
+# NOTE: Only applies to MySQL (source + mysql target).
+#       Snowflake targets always use single-partition JDBC — Snowflake
+#       already parallelises execution server-side.
+#
+# When ENABLE_PARTITIONING = True:
+#   - pk_range mode : bounds auto-derived from PK_RANGE if not set manually.
+#   - pk_set mode   : partitioning is disabled (too few rows to benefit).
+#   - full mode     : a pre-query SELECT MIN/MAX runs to detect bounds.
+#
+# Set ENABLE_PARTITIONING = False to use single-partition JDBC (original behaviour).
+
+ENABLE_PARTITIONING: bool = False
+
+PARTITION_COL: Optional[str] = None          # e.g. "ledger_id" — auto-set from PRIMARY_KEYS[0] if None
+PARTITION_LOWER_BOUND: Optional[int] = None  # auto-derived from PK_RANGE when pk_range mode
+PARTITION_UPPER_BOUND: Optional[int] = None  # auto-derived from PK_RANGE when pk_range mode
+NUM_PARTITIONS: int = 4                      # parallel JDBC connections (4–8 for local[*])
+
 
 # ============================================================================
 # AUTO-CONFIGURATION LOADER  (Do not edit below this line)
@@ -193,8 +246,8 @@ else:
         OUTPUT_DIR = "output/custom"
 
 
-
-
+# cols to exclude since this is different at each load
+EXCLUDE_COLS=["load_ts","batch_id"]
 # CSV file paths (derived — do not edit)
 SOURCE_CSV = os.path.join(OUTPUT_DIR, "source_enriched.csv")
 TARGET_CSV = os.path.join(OUTPUT_DIR, "target_actual.csv")
@@ -202,59 +255,26 @@ REPORT_CSV = os.path.join(OUTPUT_DIR, "diff_report.csv")
 
 
 # ============================================================================
-# FILTER BUILDER  (Do not edit — reads SECTION 2 & 3 variables above)
+# FILTER BUILDER  (reads SECTION 2 & 3 variables above)
 # ============================================================================
 
-def _build_load_filters() -> tuple:
-    """
-    Build separate WHERE clause filters for source and target queries.
-    Uses correct PK column for each (source_primary_keys vs target_primary_keys).
-
-    Returns
-    -------
-    tuple
-        (source_filter_dict, target_filter_dict)
-        Each dict has: {"where_clause": str, "pk_mode": str, "date_mode": str, "description": str}
-    """
-    if not _config:
-        return {"where_clause": "", "description": "no config"}, {"where_clause": "", "description": "no config"}
-    
-    try:
-        source_filter = build_filter_for_query(
-            query_type="source",
-            config=_config,
-            pk_filter_mode=PK_FILTER_MODE,
-            pk_range=PK_RANGE,
-            pk_set=PK_SET,
-            date_mode=DATE_WATERMARK_MODE,
-            date_from=DATE_FROM,
-            date_from_col=DATE_FROM_COL,
-            date_to=DATE_TO,
-            date_to_col=DATE_TO_COL,
-        )
-        
-        target_filter = build_filter_for_query(
-            query_type="target",
-            config=_config,
-            pk_filter_mode=PK_FILTER_MODE,
-            pk_range=PK_RANGE,
-            pk_set=PK_SET,
-            date_mode=DATE_WATERMARK_MODE,
-            date_from=DATE_FROM,
-            date_from_col=DATE_FROM_COL,
-            date_to=DATE_TO,
-            date_to_col=DATE_TO_COL,
-        )
-        
-        return source_filter, target_filter
-        
-    except (ValueError, FileNotFoundError) as exc:
-        logger.error("Filter configuration error: %s", exc)
-        sys.exit(1)
-
-
 # Build filters once at module load — fails fast on bad config
-SOURCE_FILTER, TARGET_FILTER = _build_load_filters()
+try:
+    SOURCE_FILTER, TARGET_FILTER = build_load_filters(
+        config=_config,
+        pk_filter_mode=PK_FILTER_MODE,
+        pk_range=PK_RANGE,
+        pk_set=PK_SET,
+        date_mode=DATE_WATERMARK_MODE,
+        date_from=DATE_FROM,
+        date_from_col=DATE_FROM_COL,
+        date_to=DATE_TO,
+        date_to_col=DATE_TO_COL,
+    )
+except (ValueError, FileNotFoundError) as exc:
+    logger.error("Filter configuration error: %s", exc)
+    sys.exit(1)
+
 
 logger.info("Source filter: %s", SOURCE_FILTER["description"])
 if SOURCE_FILTER["where_clause"]:
@@ -264,183 +284,119 @@ logger.info("Target filter: %s", TARGET_FILTER["description"])
 if TARGET_FILTER["where_clause"]:
     logger.info("  WHERE %s", TARGET_FILTER["where_clause"])
 
-EXCLUDE_COLS=["load_ts"]
-
 # ============================================================================
-# PIPELINE STEPS
+# PARTITIONING AUTO-DERIVE  (Do not edit — reads SECTION 4 variables above)
 # ============================================================================
 
-def step_0_verify_source_schema(spark):
-    """Step 0: Verify source schema (optional)."""
-    if not VERIFY_SCHEMA or not SOURCE_DDL:
-        return True
+_NEEDS_PREQUERY_BOUNDS = False  # set True when full mode needs MIN/MAX pre-query
 
-    logger.info("=" * 60)
-    logger.info("STEP 0: Verify Source Schema")
-    logger.info("=" * 60)
+if ENABLE_PARTITIONING:
+    # Auto-set partition column from first primary key
+    # Use source PK for source queries, target PK for target queries
+    SOURCE_PARTITION_COL: Optional[str] = None
+    TARGET_PARTITION_COL: Optional[str] = None
 
-    passed = verify_schema_from_ddl(
-        spark=spark,
-        jdbc_opts=get_source_connection(),
-        ddl_file=SOURCE_DDL,
-        database=_config.get("source_database"),
-        table=_config.get("source_table"),
-        dialect="mysql",
-    )
+    if PARTITION_COL is None:
+        if _config.get("source_primary_keys"):
+            SOURCE_PARTITION_COL = _config["source_primary_keys"][0]
+        if _config.get("target_primary_keys"):
+            TARGET_PARTITION_COL = _config["target_primary_keys"][0]
+        if not SOURCE_PARTITION_COL and PRIMARY_KEYS:
+            SOURCE_PARTITION_COL = PRIMARY_KEYS[0]
+        if not TARGET_PARTITION_COL and PRIMARY_KEYS:
+            TARGET_PARTITION_COL = PRIMARY_KEYS[0]
+        # Set PARTITION_COL to source PK for backward compat logging
+        PARTITION_COL = SOURCE_PARTITION_COL
+        logger.info("Partition columns auto-set — source: %s, target: %s",
+                     SOURCE_PARTITION_COL, TARGET_PARTITION_COL)
+    else:
+        SOURCE_PARTITION_COL = PARTITION_COL
+        TARGET_PARTITION_COL = PARTITION_COL
+        logger.info("Partition column (manual): %s", PARTITION_COL)
 
-    if not passed:
-        logger.error("Source schema verification FAILED")
-        return False
+    if PK_FILTER_MODE == "pk_set":
+        # Too few rows to benefit from partitioning
+        logger.warning(
+            "Partitioning disabled: pk_set mode has too few rows to benefit. "
+            "Using single-partition JDBC."
+        )
+        ENABLE_PARTITIONING = False
 
-    logger.info("Source schema verification PASSED")
-    return True
+    elif PK_FILTER_MODE == "pk_range":
+        # Auto-derive bounds from PK_RANGE if not manually set
+        if PARTITION_LOWER_BOUND is None and PK_RANGE.get("lower") is not None:
+            PARTITION_LOWER_BOUND = PK_RANGE["lower"]
+        if PARTITION_UPPER_BOUND is None and PK_RANGE.get("upper") is not None:
+            PARTITION_UPPER_BOUND = PK_RANGE["upper"]
+        if PARTITION_LOWER_BOUND is None or PARTITION_UPPER_BOUND is None:
+            logger.warning(
+                "Partitioning disabled: pk_range mode but PK_RANGE bounds are incomplete. "
+                "Set PARTITION_LOWER_BOUND/PARTITION_UPPER_BOUND manually."
+            )
+            ENABLE_PARTITIONING = False
+        else:
+            logger.info(
+                "Partition bounds auto-derived from PK_RANGE: [%d, %d], %d partitions",
+                PARTITION_LOWER_BOUND, PARTITION_UPPER_BOUND, NUM_PARTITIONS,
+            )
 
+    elif PK_FILTER_MODE == "full":
+        # Need a pre-query to detect MIN/MAX bounds at runtime
+        if PARTITION_LOWER_BOUND is None or PARTITION_UPPER_BOUND is None:
+            _NEEDS_PREQUERY_BOUNDS = True
+            logger.info(
+                "Partitioning enabled (full mode): bounds will be auto-detected "
+                "via SELECT MIN/MAX pre-query at runtime."
+            )
+        else:
+            logger.info(
+                "Partition bounds (manual): [%d, %d], %d partitions",
+                PARTITION_LOWER_BOUND, PARTITION_UPPER_BOUND, NUM_PARTITIONS,
+            )
 
-def step_1_extract_source(spark):
-    """Step 1: Extract source data, applying SOURCE_FILTER WHERE clause."""
-    logger.info("=" * 60)
-    logger.info("STEP 1: Extract Source Data  [filter: %s]", SOURCE_FILTER["description"])
-    logger.info("=" * 60)
+    if ENABLE_PARTITIONING and not PARTITION_COL:
+        logger.warning(
+            "Partitioning disabled: no PARTITION_COL and no PRIMARY_KEYS available."
+        )
+        ENABLE_PARTITIONING = False
 
-    base_sql  = _resolve_query(SOURCE_QUERY, SOURCE_QUERY_FILE, "source")
-    final_sql = apply_filter_to_sql(base_sql, SOURCE_FILTER["where_clause"])
-
-    if SOURCE_FILTER["where_clause"]:
-        logger.info("Applied WHERE clause: %s", SOURCE_FILTER["where_clause"])
-
-    source_df = get_data(spark=spark, db_type="source", query=final_sql)
-
-    logger.info("Step 1 complete.")
-    return source_df
-
-
-def step_2_transform(source_df, target_mode: Literal["mysql", "snowflake"] = "mysql"):
-    """Step 2: Apply transformations to source data."""
-    logger.info("=" * 60)
-    logger.info("STEP 2: Apply Transformations")
-    logger.info("=" * 60)
-
-    transformed_df = perform_transform(
-        df=source_df,
-        transform_file=TRANSFORM_FILE,
-        target_mode=target_mode,
-    )
-
-    logger.info("Step 2 complete.")
-    return transformed_df
-
-
-def step_3_save_source_csv(transformed_df):
-    """Step 3: Save transformed source data to CSV."""
-    logger.info("=" * 60)
-    logger.info("STEP 3: Save Transformed CSV")
-    logger.info("=" * 60)
-
-    save_dataframe_as_csv(transformed_df, SOURCE_CSV)
-    logger.info("Source data saved → %s", SOURCE_CSV)
-    logger.info("Step 3 complete.")
-
-
-def step_4_1_save_target_csv(target_df):
-    """Step 4.1: Save target data to CSV."""
-    logger.info("=" * 60)
-    logger.info("STEP 4.1: Save Target CSV")
-    logger.info("=" * 60)
-
-    save_dataframe_as_csv(target_df, TARGET_CSV)
-    logger.info("Target data saved → %s", TARGET_CSV)
-    logger.info("Step 4.1 complete.")
+if ENABLE_PARTITIONING:
+    logger.info("JDBC Partitioning: ENABLED (col=%s, partitions=%d)", PARTITION_COL, NUM_PARTITIONS)
+else:
+    logger.info("JDBC Partitioning: DISABLED (single-partition reads)")
 
 
-def step_3_5_verify_target_schema(spark):
-    """Step 3.5: Verify target schema (optional)."""
-    if not VERIFY_SCHEMA or not TARGET_DDL:
-        return True
+# ============================================================================
+# PIPELINE CONTEXT — bundles all resolved config for step functions
+# ============================================================================
 
-    logger.info("=" * 60)
-    logger.info("STEP 3.5: Verify Target Schema")
-    logger.info("=" * 60)
-
-    jdbc_opts = get_target_connection(mode=TARGET_MODE)
-    schema = jdbc_opts.get("sfSchema", "PUBLIC") if TARGET_MODE == "snowflake" else None
-
-    passed = verify_schema_from_ddl(
-        spark=spark,
-        jdbc_opts=jdbc_opts,
-        ddl_file=TARGET_DDL,
-        database=_config.get("target_database"),
-        table=_config.get("target_table"),
-        dialect=TARGET_MODE,
-        schema=schema,
-    )
-
-    if not passed:
-        logger.error("Target schema verification FAILED")
-        return False
-
-    logger.info("Target schema verification PASSED")
-    return True
-
-
-def step_4_extract_target(spark):
-    """Step 4: Extract target data, applying TARGET_FILTER WHERE clause."""
-    logger.info("=" * 60)
-    logger.info("STEP 4: Extract Target Data  [filter: %s]", TARGET_FILTER["description"])
-    logger.info("=" * 60)
-
-    base_sql  = _resolve_query(TARGET_QUERY, TARGET_QUERY_FILE, "target")
-    final_sql = apply_filter_to_sql(base_sql, TARGET_FILTER["where_clause"])
-
-    if TARGET_FILTER["where_clause"]:
-        logger.info("Applied WHERE clause: %s", TARGET_FILTER["where_clause"])
-
-    target_df = get_data(
-        spark=spark,
-        db_type="target",
-        query=final_sql,
-        target_mode=TARGET_MODE,
-    )
-
-    logger.info("Step 4 complete.")
-    return target_df
-
-
-def step_5_compare(spark, transformed_df, target_df):
-    """Step 5: Compare source and target DataFrames and generate report."""
-    logger.info("=" * 60)
-    logger.info("STEP 5: Compare Data & Generate Report")
-    logger.info("=" * 60)
-
-    compare_cols = COMPARE_COLS
-    if compare_cols is None:
-        all_cols     = set(transformed_df.columns) & set(target_df.columns)
-        compare_cols = sorted(all_cols - set(PRIMARY_KEYS) - set(EXCLUDE_COLS or []))
-        logger.info("Auto-detected compare columns: %s", compare_cols)
-
-    exit_code = compare_and_report(
-        spark=spark,
-        source_df=transformed_df,
-        target_df=target_df,
-        primary_key_cols=PRIMARY_KEYS,
-        compare_cols=compare_cols,
-        output_path=REPORT_CSV,
-    )
-
-    logger.info("Step 5 complete.")
-    return exit_code
-
-
-def load_csvs(spark):
-    """Helper: Load existing CSVs from disk (for compare-only runs)."""
-    logger.info("Loading source CSV: %s", SOURCE_CSV)
-    transformed_df = (
-        spark.read.option("header", True).option("inferSchema", False).csv(SOURCE_CSV)
-    )
-    logger.info("Loading target CSV: %s", TARGET_CSV)
-    target_df = (
-        spark.read.option("header", True).option("inferSchema", False).csv(TARGET_CSV)
-    )
-    return transformed_df, target_df
+pipeline_ctx = dict(
+    config=_config,
+    target_mode=TARGET_MODE,
+    verify_schema=VERIFY_SCHEMA,
+    source_query=SOURCE_QUERY,
+    source_query_file=SOURCE_QUERY_FILE,
+    target_query=TARGET_QUERY,
+    target_query_file=TARGET_QUERY_FILE,
+    transform_file=TRANSFORM_FILE,
+    primary_keys=PRIMARY_KEYS,
+    exclude_cols=EXCLUDE_COLS,
+    compare_cols=COMPARE_COLS,
+    source_ddl=SOURCE_DDL,
+    target_ddl=TARGET_DDL,
+    source_csv=SOURCE_CSV,
+    target_csv=TARGET_CSV,
+    report_csv=REPORT_CSV,
+    source_filter=SOURCE_FILTER,
+    target_filter=TARGET_FILTER,
+    enable_partitioning=ENABLE_PARTITIONING,
+    needs_prequery_bounds=_NEEDS_PREQUERY_BOUNDS,
+    source_partition_col=SOURCE_PARTITION_COL if ENABLE_PARTITIONING else None,
+    target_partition_col=TARGET_PARTITION_COL if ENABLE_PARTITIONING else None,
+    partition_lower_bound=PARTITION_LOWER_BOUND,
+    partition_upper_bound=PARTITION_UPPER_BOUND,
+    num_partitions=NUM_PARTITIONS,
+)
 
 
 # ============================================================================
@@ -453,11 +409,15 @@ def main() -> int:
 
     Patterns
     --------
-    A  Full pipeline   : steps 0, 1, 2, 3, 3.5, 4, 4.1, 5
-    B  Compare only    : load_csvs() + step 5
-    C  Source only     : steps 1, 2, 3
-    D  Target only     : step 4
-    E  Custom          : mix and match as needed
+    A  Full pipeline    : steps 0, 1, 2, 3, 3.5, 4, 4.1, 5
+    B  Compare only     : load_csvs() + step 5
+    C  Source only      : steps 1, 2, 3
+    D  Target only      : step 4
+    E  Custom           : mix and match as needed
+    F  CSV re-use       : load_source_csv() + steps 3.5, 4, 5
+                          (USE_SAVED_SOURCE_CSV = True)
+    G  Full CSV re-use  : load_source_csv() + load_target_csv() + step 5
+                          (USE_SAVED_SOURCE_CSV = True, USE_SAVED_TARGET_CSV = True)
     """
     start_time = time.time()
 
@@ -466,6 +426,8 @@ def main() -> int:
         logger.info("Custom ETL Validation Pipeline")
         logger.info("  Table  : %s", TABLE_NAME or "(manual)")
         logger.info("  Target : %s", TARGET_MODE)
+        logger.info("  Source : %s", "saved CSV" if USE_SAVED_SOURCE_CSV else "live extraction")
+        logger.info("  Target : %s", "saved CSV" if USE_SAVED_TARGET_CSV else "live extraction")
         logger.info("  Source filter : %s", SOURCE_FILTER["description"])
         logger.info("  Target filter : %s", TARGET_FILTER["description"])
         logger.info("=" * 60)
@@ -473,42 +435,61 @@ def main() -> int:
         os.makedirs(OUTPUT_DIR, exist_ok=True)
 
         spark = get_spark_session(app_name="ETL_Custom")
+        spark.conf.set("spark.sql.debug.maxToStringFields", 500)  # Default is 25
 
-        # Step 0: optional source schema check
-        if not step_0_verify_source_schema(spark):
-            logger.error("Exiting due to source schema verification failure")
-            return 2
+        if USE_SAVED_SOURCE_CSV:
+            # ── Pattern F/G: load source from previously saved CSV ───────
+            # Skips steps 0 (source schema verify), 1 (extract), 2 (transform), 3 (save CSV)
+            transformed_df = load_source_csv(spark, pipeline_ctx)
+        else:
+            # ── Pattern A: full live extraction ─────────────────────────
+            # Step 0: optional source schema check
+            if not step_0_verify_source_schema(spark, pipeline_ctx):
+                logger.error("Exiting due to source schema verification failure")
+                return 2
 
-        # Step 1: extract source
-        t0 = time.time()
-        source_df = step_1_extract_source(spark)
-        source_df.printSchema()
-        row_count = source_df.count()
-        logger.info("Source row count: %d  (%.2fs)", row_count, time.time() - t0)
+            # Step 1: extract source
+            source_df = step_1_extract_source(spark, pipeline_ctx)
 
-        # Step 2: transform
-        t0 = time.time()
-        transformed_df = step_2_transform(source_df, TARGET_MODE)
-        transformed_df.printSchema()
-        row_count = transformed_df.count()
-        logger.info("Transformed row count: %d  (%.2fs)", row_count, time.time() - t0)
+            # Step 2: transform
+            t0 = time.time()
+            transformed_df = step_2_transform(source_df, pipeline_ctx, TARGET_MODE)
+            transform_time = time.time() - t0
+            logger.info("Transform time: %.2fs", transform_time)
 
-        # Step 3: save source CSV
-        step_3_save_source_csv(transformed_df)
+            # Step 3: save source CSV
+            step_3_save_source_csv(transformed_df, source_df, pipeline_ctx)
 
-        # Step 3.5: optional target schema check
-        if not step_3_5_verify_target_schema(spark):
-            logger.error("Exiting due to target schema verification failure")
-            return 2
+        if USE_SAVED_TARGET_CSV:
+            # ── Pattern G: load target from previously saved CSV ─────────
+            # Skips steps 3.5 (target schema verify) and 4 (target extraction)
+            target_df = load_target_csv(spark, pipeline_ctx)
+        else:
+            # Step 3.5: optional target schema check
+            if not step_3_5_verify_target_schema(spark, pipeline_ctx):
+                logger.error("Exiting due to target schema verification failure")
+                return 2
 
-        # Step 4: extract target
-        target_df = step_4_extract_target(spark)
-        step_4_1_save_target_csv(target_df)
+            # Step 4: extract target
+            target_df = step_4_extract_target(spark, pipeline_ctx)
+            step_4_1_save_target_csv(target_df, pipeline_ctx)
 
         # Step 5: compare
-        exit_code = step_5_compare(spark, transformed_df, target_df)
+        t0 = time.time()
+        exit_code = step_5_compare(spark, transformed_df, target_df, pipeline_ctx)
+        compare_time = time.time() - t0
+        logger.info("Compare and Report time: %.2fs", compare_time)
 
-        spark.stop()
+        # Cleanup: unpersist cached DataFrames after comparison completes
+        # (compare_dataframes may have already released these as an optimisation)
+        logger.info("Ensuring cached DataFrames are released...")
+        if transformed_df.is_cached:
+            transformed_df.unpersist()
+        if target_df.is_cached:
+            target_df.unpersist()
+        logger.info("Cache cleanup complete.")
+
+        # spark.stop()
 
         elapsed = timedelta(seconds=int(time.time() - start_time))
         minutes = elapsed.seconds // 60
@@ -529,25 +510,6 @@ def main() -> int:
     except Exception as exc:
         logger.exception("Unexpected error: %s", exc)
         return 99
-
-
-def _resolve_query(query: str, query_file: str, query_type: str) -> str:
-    """Return SQL string from either inline query or file (no trailing semicolon)."""
-    if query:
-        sql = query.strip()
-        return sql[:-1].strip() if sql.endswith(";") else sql
-    if query_file:
-        if not os.path.isfile(query_file):
-            raise FileNotFoundError(
-                f"{query_type.upper()} query file not found: {query_file}"
-            )
-        with open(query_file, "r", encoding="utf-8") as fh:
-            content = fh.read().strip()
-        return content[:-1].strip() if content.endswith(";") else content
-    raise ValueError(
-        f"Either {query_type.upper()}_QUERY or {query_type.upper()}_QUERY_FILE "
-        "must be provided"
-    )
 
 
 if __name__ == "__main__":

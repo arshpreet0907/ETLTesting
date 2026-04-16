@@ -63,9 +63,36 @@ def get_spark_session(app_name: str = "ETLValidator"):
         .master("local[*]")
         .appName(app_name)
         .config("spark.ui.enabled", "false")
-        .config("spark.driver.memory", "2g")
-        .config("spark.sql.shuffle.partitions", "4")   # low for single-machine ETL
+
+        # Driver memory — increased from 2g -> 4g
+        # At 1M rows with 20+ columns, the full-outer-join shuffle + cached
+        # source/target DataFrames comfortably exceed 2 GB of driver heap.
+        # 4 GB keeps the GC overhead low and avoids spill-to-disk during joins.
+        # If your machine has < 8 GB RAM available, drop to 3g.
+        .config("spark.driver.memory", "4g")
+        .config("spark.sql.shuffle.partitions", "4")  # low for single-machine ETL
         .config("spark.sql.legacy.timeParserPolicy", "LEGACY")
+
+        # Kryo serializer — faster than Java default
+        # Kryo is ~10× faster to serialize/deserialize than Java's default
+        # ObjectOutputStream. For local mode this matters during shuffle and
+        # cache operations on large DataFrames.
+        .config("spark.serializer", "org.apache.spark.serializer.KryoSerializer")
+        .config("spark.kryoserializer.buffer.max", "512m")
+
+        # JDBC network timeout — prevents silent hangs
+        # MySQL defaults can stall the JDBC connection on large reads without
+        # raising an exception. These settings ensure Spark fails fast and
+        # raises a visible error instead of hanging indefinitely.
+        .config("spark.network.timeout", "800s")
+        .config("spark.executor.heartbeatInterval", "60s")
+
+        # Python worker hardening — prevents "Python worker failed to connect
+        # back" SocketTimeoutException under memory pressure.
+        # Reuse workers instead of spawning new ones for each task.
+        .config("spark.python.worker.reuse", "true")
+        # Increase the connection timeout (default 15s is tight on loaded machines).
+        .config("spark.python.worker.timeout", "120")
     )
 
     if jars_csv:
